@@ -61,7 +61,6 @@ else:
         st.write_stream(stream)
 
         # Add web search functionality
-        llm = OpenAI(api_key=openai_api_key, temperature=0)
         search = GoogleSerperAPIWrapper()
         tools = [
             Tool(
@@ -71,7 +70,7 @@ else:
             )
         ]
 
-        self_ask_with_search = initialize_agent(tools, llm, agent=AgentType.SELF_ASK_WITH_SEARCH, verbose=True)
+        self_ask_with_search = initialize_agent(tools, OpenAI(), agent=AgentType.SELF_ASK_WITH_SEARCH, verbose=True)
         search_result = self_ask_with_search.run(question)
 
         st.write("### Web Search Result")
