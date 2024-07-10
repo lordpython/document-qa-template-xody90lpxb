@@ -3,6 +3,7 @@ from openai import OpenAI
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain.agents import initialize_agent, Tool
 from langchain.agents import AgentType
+from langchain.chat_models import ChatOpenAI
 import os
 
 # Show title and description.
@@ -90,36 +91,41 @@ Format your response as follows:
 Remember to maintain a professional and helpful tone throughout your response. If you need any clarification or additional information to complete this task, please ask.
 """
 
-        # Generate an answer using the OpenAI API.
-        messages = [
-            {
-                "role": "user",
-                "content": prompt_template,
-            }
-        ]
+          # Generate an answer using the OpenAI API.
+    messages = [
+        {
+            "role": "user",
+            "content": prompt_template,
+        }
+    ]
 
-        stream = client.chat_completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
+    stream = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        stream=True,
+    )
+
+    # Stream the response to the app using `st.write`.
+    response = st.empty()
+    full_response = ""
+    for chunk in stream:
+        if chunk.choices[0].delta.content is not None:
+            full_response += chunk.choices[0].delta.content
+            response.markdown(full_response)
+
+    # Add web search functionality
+    search = GoogleSerperAPIWrapper()
+    tools = [
+        Tool(
+            name="Intermediate Answer",
+            func=search.run,
+            description="Useful for when you need to answer with search"
         )
+    ]
 
-        # Stream the response to the app using `st.write`.
-        for message in stream:
-            st.write(message['choices'][0]['delta']['content'], end="")
+    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+    self_ask_with_search = initialize_agent(tools, llm, agent=AgentType.SELF_ASK_WITH_SEARCH, verbose=True)
+    search_result = self_ask_with_search.run(question)
 
-        # Add web search functionality
-        search = GoogleSerperAPIWrapper()
-        tools = [
-            Tool(
-                name="Intermediate Answer",
-                func=search.run,
-                description="Useful for when you need to answer with search"
-            )
-        ]
-
-        self_ask_with_search = initialize_agent(tools, OpenAI(), agent=AgentType.SELF_ASK_WITH_SEARCH, verbose=True)
-        search_result = self_ask_with_search.run(question)
-
-        st.write("### Web Search Result")
-        st.write(search_result)
+    st.write("### Web Search Result")
+    st.write(search_result)
