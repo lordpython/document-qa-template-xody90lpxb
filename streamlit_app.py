@@ -1,131 +1,178 @@
 import streamlit as st
+import streamlit_authenticator as stauth
+import yaml
+from yaml.loader import SafeLoader
 from openai import OpenAI
 from langchain_community.utilities import GoogleSerperAPIWrapper
 from langchain.agents import initialize_agent, Tool
 from langchain.agents import AgentType
-from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import spacy
+import pandas as pd
+import altair as alt
 import os
+import time
+import base64
+import io
 
-# Show title and description.
-st.title("📄 Document Question Answering with Web Search")
-st.write(
-    "Upload a document below and ask a question about it – GPT will answer! "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
+# Load spaCy model for NER
+nlp = spacy.load("en_core_web_sm")
+
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize Google Serper
+search = GoogleSerperAPIWrapper(serper_api_key=os.getenv("SERPER_API_KEY"))
+
+# Constants
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+
+# Load configuration file
+with open('config.yaml') as file:
+    config = yaml.load(file, Loader=SafeLoader)
+
+# Create an authentication object
+authenticator = stauth.Authenticate(
+    config['credentials'],
+    config['cookie']['name'],
+    config['cookie']['key'],
+    config['cookie']['expiry_days'],
+    config['preauthorized']
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-serper_api_key = st.text_input("Serper API Key", type="password")
+# Custom CSS
+st.markdown("""
+<style>
+.big-font {
+    font-size:20px !important;
+    font-weight: bold;
+}
+.stProgress > div > div > div > div {
+    background-color: #4CAF50;
+}
+</style>
+""", unsafe_allow_html=True)
 
-if not openai_api_key or not serper_api_key:
-    st.info("Please add your OpenAI and Serper API keys to continue.", icon="🗝️")
-else:
-    # Set environment variables for API keys
-    os.environ["SERPER_API_KEY"] = serper_api_key
-    os.environ["OPENAI_API_KEY"] = openai_api_key
+def perform_ner(text):
+    doc = nlp(text)
+    entities = [(ent.text, ent.label_) for ent in doc.ents]
+    return entities
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
-
-    # Let the user upload a file via `st.file_uploader`.
-    uploaded_file = st.file_uploader(
-        "Upload a document (.txt or .md)", type=("txt", "md")
+def process_document(document, question):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
     )
-
-    # Ask the user for a question via `st.text_area`.
-    question = st.text_area(
-        "Now ask a question about the document!",
-        placeholder="Can you give me a short summary?",
-        disabled=not uploaded_file,
-    )
-
-    if uploaded_file and question:
-        # Process the uploaded file and question.
-        document = uploaded_file.read().decode()
-
-        prompt_template = f"""
-You are an AI assistant designed to answer questions about uploaded documents. Your task is to process a given document, understand its content, and then answer a specific question about it. You will also need to use provided API keys for additional functionality if necessary.
-
-First, you will receive the content of an uploaded document:
-
-<document>
-{document}
-</document>
-
-Next, you will be given a question about this document:
-
-<question>
-{question}
-</question>
-
-To process the document and answer the question, follow these steps:
-
-1. Carefully read and analyze the content of the document.
-2. Identify key information, main ideas, and relevant details that relate to the question.
-3. If the question can be answered directly from the document content, formulate a clear and concise answer based on the information provided.
-4. If additional information is needed to fully answer the question, you may use the provided API keys to access external resources. The API keys are:
-
-   OpenAI API Key: {openai_api_key}
-   Serper API Key: {serper_api_key}
-
-   Use these keys responsibly and only when necessary to supplement the information in the document.
-
-5. When using external resources, clearly indicate in your answer that additional information was used and briefly explain why it was necessary.
-
-6. Ensure your answer is comprehensive, accurate, and directly addresses the question asked.
-
-7. If the question cannot be answered based on the document content and available resources, clearly state this and explain why.
-
-Format your response as follows:
-
-<answer>
-[Your detailed answer to the question, based on the document and any additional information if used]
-</answer>
-
-<sources>
-[If external resources were used, list them here with brief descriptions of how they contributed to the answer]
-</sources>
-
-Remember to maintain a professional and helpful tone throughout your response. If you need any clarification or additional information to complete this task, please ask.
-"""
-
-          # Generate an answer using the OpenAI API.
-    messages = [
-        {
-            "role": "user",
-            "content": prompt_template,
-        }
-    ]
-
-    stream = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=messages,
-        stream=True,
-    )
-
-    # Stream the response to the app using `st.write`.
-    response = st.empty()
-    full_response = ""
-    for chunk in stream:
-        if chunk.choices[0].delta.content is not None:
-            full_response += chunk.choices[0].delta.content
-            response.markdown(full_response)
-
-    # Add web search functionality
-    search = GoogleSerperAPIWrapper()
+    chunks = text_splitter.split_text(document)
+    
+    llm = ChatOpenAI(temperature=0.2, model="gpt-4o-turbo")
     tools = [
         Tool(
-            name="Intermediate Answer",
+            name="Web Search",
             func=search.run,
-            description="Useful for when you need to answer with search"
+            description="Useful for finding additional information online"
         )
     ]
+    agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+    
+    final_answer = ""
+    for i, chunk in enumerate(chunks):
+        prompt = f"""
+        Analyze the following document chunk and answer the question. If you need additional information, 
+        use the web search tool provided. This is chunk {i+1} of {len(chunks)}.
 
-    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
-    self_ask_with_search = initialize_agent(tools, llm, agent=AgentType.SELF_ASK_WITH_SEARCH, verbose=True)
-    search_result = self_ask_with_search.run(question)
+        Document Chunk:
+        {chunk}
 
-    st.write("### Web Search Result")
-    st.write(search_result)
+        Question: {question}
+
+        Provide a clear and concise answer based on the document content and any additional 
+        information from web search if necessary.
+        """
+        chunk_result = agent.run(prompt)
+        final_answer += chunk_result + "\n\n"
+    
+    return final_answer
+
+def main():
+    st.title("📄 Advanced Document Q&A with Web Search")
+
+    # Authentication
+    name, authentication_status, username = authenticator.login('Login', 'main')
+
+    if authentication_status:
+        st.write(f'Welcome *{name}*')
+        
+        uploaded_file = st.file_uploader("Upload a document (.txt or .md)", type=("txt", "md"))
+        
+        if uploaded_file:
+            if uploaded_file.size > MAX_FILE_SIZE:
+                st.error(f"File size exceeds the maximum limit of {MAX_FILE_SIZE/1024/1024:.2f} MB.")
+            else:
+                document = uploaded_file.read().decode()
+                st.success("File uploaded successfully!")
+
+                # Document analysis
+                with st.expander("Document Analysis"):
+                    entities = perform_ner(document)
+                    st.write("### Named Entities")
+                    st.write(entities)
+
+                    # Word cloud
+                    words = document.split()
+                    word_freq = pd.DataFrame(pd.Series(words).value_counts()).reset_index()
+                    word_freq.columns = ['word', 'count']
+                    
+                    chart = alt.Chart(word_freq.head(50)).mark_circle().encode(
+                        size='count',
+                        color=alt.value('steelblue'),
+                        tooltip=['word', 'count']
+                    ).interactive()
+                    
+                    st.write("### Document Word Cloud")
+                    st.altair_chart(chart, use_container_width=True)
+
+                # Q&A
+                question = st.text_area(
+                    "Ask a question about the document",
+                    placeholder="Can you give me a short summary?",
+                    max_chars=500
+                )
+
+                if question:
+                    with st.spinner("Processing your question..."):
+                        try:
+                            answer = process_document(document, question)
+                            st.write("### Answer")
+                            st.write(answer)
+
+                            # Add to history
+                            if 'history' not in st.session_state:
+                                st.session_state.history = []
+                            st.session_state.history.append({"question": question, "answer": answer})
+
+                        except Exception as e:
+                            st.error(f"An error occurred: {str(e)}")
+
+                # Display history
+                if 'history' in st.session_state and st.session_state.history:
+                    with st.expander("Question History"):
+                        for item in st.session_state.history:
+                            st.write(f"Q: {item['question']}")
+                            st.write(f"A: {item['answer']}")
+                            st.write("---")
+
+        # Logout button
+        authenticator.logout('Logout', 'main')
+
+    elif authentication_status == False:
+        st.error('Username/password is incorrect')
+    elif authentication_status == None:
+        st.warning('Please enter your username and password')
+
+if __name__ == "__main__":
+    main()
